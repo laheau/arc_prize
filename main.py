@@ -1,68 +1,61 @@
-def main():
-    # Lightweight smoke test to validate the model wiring and losses.
-    from src.arc_model import (
-        ArcPrizeModel,
-        ArcTransformerModel,
-        reconstruction_loss,
-        reconstruction_loss_grid_ce,
-        reconstruction_loss_grid_mse,
-        direction_loss,
-        predict_f,
-    )
-    import torch
+from torch.utils.data import DataLoader, Dataset
 
-    B, input_dim, latent_dim = 2, 16, 8
-    model = ArcPrizeModel(input_dim, latent_dim)
-    A = torch.randn(B, input_dim)
-    Bx = torch.randn(B, input_dim)
-    C = torch.randn(B, input_dim)
-    Dx = torch.randn(B, input_dim)
-    E = torch.randn(B, input_dim)
+import torch
+from src.gptcode import MaskedAutoencoderTwoView
 
-    z_a, a_rec = model(A)
-    z_b, b_rec = model(Bx)
-    z_c, c_rec = model(C)
-    z_d, d_rec = model(Dx)
+# Dummy dataset example
+class DummyTwoViewDataset(Dataset):
+    def __init__(self, num_samples=1000, img_size=32, in_chans=12):
+        super().__init__()
+        self.num_samples = num_samples
+        self.img_size = img_size
+        self.in_chans = in_chans
 
-    loss_dir = direction_loss(z_a, z_b, z_c, z_d, same_task=True)
-    loss_rec = (
-        reconstruction_loss(A, a_rec)
-        + reconstruction_loss(Bx, b_rec)
-        + reconstruction_loss(C, c_rec)
-        + reconstruction_loss(Dx, d_rec)
-    ) / 4
+    def __len__(self):
+        return self.num_samples
 
-    _, x_f_pred, _ = predict_f(model, A, Bx, E)
-    print({
-        "loss_dir": float(loss_dir.detach()),
-        "loss_rec": float(loss_rec.detach()),
-        "x_f_pred_shape": tuple(x_f_pred.shape),
-    })
+    def __getitem__(self, idx):
+        # Replace this with real data (two views of same object)
+        x = torch.randn(2, self.in_chans, self.img_size, self.img_size)
+        return x  # (2,12,32,32)
 
-    # Transformer 2D: categorical grid example
-    H, W, C = 8, 8, 10
-    tmodel = ArcTransformerModel(H, W, d_model=64, nhead=8, num_layers_enc=2, num_layers_dec=2, num_classes=C)
-    A = torch.randint(0, C, (B, H, W))
-    Bx = torch.randint(0, C, (B, H, W))
-    Cx = torch.randint(0, C, (B, H, W))
-    Dx = torch.randint(0, C, (B, H, W))
-    Ex = torch.randint(0, C, (B, H, W))
-    z_a, a_rec_logits = tmodel(A)
-    z_b, b_rec_logits = tmodel(Bx)
-    z_c, c_rec_logits = tmodel(Cx)
-    z_d, d_rec_logits = tmodel(Dx)
-    loss_dir_t = direction_loss(z_a, z_b, z_c, z_d, same_task=True)
-    loss_rec_t = (
-        reconstruction_loss_grid_ce(A, a_rec_logits)
-        + reconstruction_loss_grid_ce(Bx, b_rec_logits)
-        + reconstruction_loss_grid_ce(Cx, c_rec_logits)
-        + reconstruction_loss_grid_ce(Dx, d_rec_logits)
-    ) / 4
-    print({
-        "t2d_loss_dir": float(loss_dir_t.detach()),
-        "t2d_loss_rec": float(loss_rec_t.detach()),
-    })
+
+def train():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    dataset = DummyTwoViewDataset(num_samples=1000, img_size=32, in_chans=12)
+    dataloader = DataLoader(dataset, batch_size=16, shuffle=True)
+
+    model = MaskedAutoencoderTwoView(
+        img_size=32,
+        in_chans=12,
+        embed_dim=256,
+        depth=6,
+        num_heads=8,
+        patch_size=4,
+        mask_ratio=0.6,
+        device=device,
+    ).to(device)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
+
+    for epoch in range(10):
+        model.train()
+        total_loss = 0.0
+        for batch in dataloader:
+            # batch: (B, 2, 12, 32, 32)
+            x = batch.to(device)
+            loss, pred, mask = model(x)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item() * x.size(0)
+
+        avg_loss = total_loss / len(dataset)
+        print(f"Epoch {epoch+1}: loss = {avg_loss:.4f}")
 
 
 if __name__ == "__main__":
-    main()
+    train()

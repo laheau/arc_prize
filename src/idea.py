@@ -6,6 +6,9 @@ import wandb
 from tqdm import tqdm
 import math
 from copy import deepcopy
+import os
+import time
+from torch.distributions import Categorical
 
 
 class GroupedQueryAttention(nn.Module):
@@ -113,20 +116,23 @@ class GQATransformerEncoderLayer(nn.Module):
 
 
 class InternalTreeNode(nn.Module):
-    def __init__(self, rec_count, child, seq_len, d_model, dim_feedforward=512, dropout=0.1):
+    def __init__(self, rec_count, child, seq_len, d_model, dim_feedforward=512, dropout=0.1, use_mlp=True):
         super(InternalTreeNode, self).__init__()
         self.rec_count = rec_count
 
         self.out_proj = nn.Linear(d_model, d_model)
         
         # MLP to generate initial y from x
-        self.mlp = nn.Sequential(
-            nn.Linear(d_model, dim_feedforward),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(dim_feedforward, d_model),
-            nn.Dropout(dropout)
-        )
+        if use_mlp:
+            self.mlp = nn.Sequential(
+                nn.Linear(d_model, dim_feedforward),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(dim_feedforward, d_model),
+                nn.Dropout(dropout)
+            )
+        else:
+            self.mlp = nn.Linear(d_model, d_model)
         
         self.norm = nn.LayerNorm(d_model)
         self.child = child
@@ -139,7 +145,7 @@ class InternalTreeNode(nn.Module):
 
 
 class Tree(nn.Module):
-    def __init__(self, depth, seq_len=81, d_model=128, nhead=8, num_kv_heads=None, dim_feedforward=512, dropout=0.1, use_gqa=True):
+    def __init__(self, depth, seq_len=81, d_model=128, nhead=8, num_kv_heads=None, dim_feedforward=512, dropout=0.1, use_gqa=True, num_layers=2, node_recursion=2, use_mlp=True):
         super(Tree, self).__init__()
         self.seq_len = seq_len
         self.d_model = d_model
@@ -155,7 +161,7 @@ class Tree(nn.Module):
                     dim_feedforward=dim_feedforward,
                     dropout=dropout
                 )
-                for _ in range(2)
+                for _ in range(num_layers)
             ]
             self.leaf = nn.Sequential(*encoder_layers)
         else:
@@ -168,18 +174,19 @@ class Tree(nn.Module):
                     dropout=dropout,
                     batch_first=True
                 ),
-                num_layers=2
+                num_layers=num_layers
             )
         
         node = self.leaf
         for _ in range(depth):
             parent = InternalTreeNode(
-                rec_count=2, 
+                rec_count=node_recursion, 
                 child=node, 
                 seq_len=seq_len, 
                 d_model=d_model,
                 dim_feedforward=dim_feedforward,
-                dropout=dropout
+                dropout=dropout,
+                use_mlp=use_mlp
             )
             node = parent
         self.root = node
@@ -192,7 +199,7 @@ class SudokuTreeModel(nn.Module):
     """Full model: embedding -> tree -> prediction head."""
     
     def __init__(self, num_classes=10, seq_len=81, d_model=128, depth=5, nhead=8, num_kv_heads=None, 
-                 dim_feedforward=512, dropout=0.1, use_gqa=True, recursion_steps=1):
+                 dim_feedforward=512, dropout=0.1, use_gqa=True, recursion_steps=1, num_layers=2, node_recursion=2, use_mlp=True):
         super(SudokuTreeModel, self).__init__()
         self.seq_len = seq_len
         self.d_model = d_model
@@ -203,7 +210,7 @@ class SudokuTreeModel(nn.Module):
         
         # 2D Positional encoding for 9x9 grid
         self.pos_encoding = self._create_2d_positional_encoding(9, 9, d_model)
-        
+        self.value_head = nn.Linear(d_model, 1)
         # Learnable initial hidden state
         self.h0 = nn.Parameter(torch.zeros(1, seq_len, d_model))
         nn.init.normal_(self.h0, std=0.02)
@@ -220,7 +227,10 @@ class SudokuTreeModel(nn.Module):
             num_kv_heads=num_kv_heads,
             dim_feedforward=dim_feedforward, 
             dropout=dropout,
-            use_gqa=use_gqa
+            use_gqa=use_gqa,
+            num_layers=num_layers,
+            node_recursion=node_recursion,
+            use_mlp=use_mlp
         )
         
         # Output head: d_model -> num_classes
@@ -274,9 +284,9 @@ class SudokuTreeModel(nn.Module):
         # Compute logits
         logits = self.head(h_new)
         B = embeddings.shape[0]
-        logits = logits.view(B, 9, 9, -1)
-        
-        return h_new, logits
+        logits = logits.view(B, 9, 9, -1).permute(0, 3, 1, 2)
+        value = self.value_head(h_new)
+        return h_new, logits, value
 
     def forward(self, x, return_all_steps=False):
         """
@@ -284,7 +294,7 @@ class SudokuTreeModel(nn.Module):
             x: [B, H, W] long tensor with values 0-9
             return_all_steps: If True, returns a list of logits for each recursion step.
         Returns:
-            logits: [B, H, W, num_classes] or list of logits
+            logits: [B, num_classes, H, W] or list of logits
         """
         embeddings = self.get_embedding(x)
         h = self.h0.expand(embeddings.size(0), -1, -1)
@@ -294,7 +304,7 @@ class SudokuTreeModel(nn.Module):
         steps = self.recursion_steps
         
         for _ in range(steps):
-            h, logits = self.forward_step(embeddings, h)
+            h, logits, value = self.forward_step(embeddings, h)
             outputs.append(logits)
             
         if return_all_steps:
@@ -363,7 +373,6 @@ def train_epoch(model, dataloader, optimizer, device, epoch, ema=None):
         puzzles = batch["puzzle"].to(device)  # [B, 9, 9]
         solutions = batch["solution"].to(device)  # [B, 9, 9]
         
-        optimizer.zero_grad()
         
         # Manual recursion loop for memory efficiency
         # We compute gradients at each step and accumulate them, freeing the graph after each step
@@ -376,26 +385,34 @@ def train_epoch(model, dataloader, optimizer, device, epoch, ema=None):
         logits = None
         
         for _ in range(model.recursion_steps):
+            optimizer.zero_grad()
+
             # Recompute embeddings to allow backprop through them at each step without retain_graph=True
             embeddings = model.get_embedding(puzzles)
             
-            h, logits = model.forward_step(embeddings, h)
-            
+            h, logits, value = model.forward_step(embeddings, h)
+            solutions = solutions.long()
             step_loss = F.cross_entropy(
-                logits.permute(0, 3, 1, 2),  # [B, C, H, W]
-                solutions.long()
+                logits,  # [B, C, H, W]
+                solutions
             )
             
+            # Value target: 1 if cell prediction is correct, 0 otherwise
+            preds = logits.argmax(dim=1) # [B, H, W]
+            is_correct = (preds == solutions).float().view(B, 81, 1)
+            value_loss = nn.BCEWithLogitsLoss()(value, is_correct)
+            
+            total_loss = step_loss + 0.1 * value_loss
             # Backward pass for this step
             # This accumulates gradients and frees the graph for this step
-            step_loss.backward()
-            batch_loss += step_loss.item()
+            total_loss.backward()
+            batch_loss += total_loss.item()
             
             # Detach h for the next step to prevent backprop through time (TBPTT k=1)
             # This is necessary because the graph for the previous step is freed
             h = h.detach()
             
-        optimizer.step()
+            optimizer.step()
         
         # Update EMA after optimizer step
         if ema is not None:
@@ -403,7 +420,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, ema=None):
         
         # Metrics (use final prediction)
         if logits is not None:
-            preds = logits.argmax(dim=-1)
+            preds = logits.argmax(dim=1)
             correct = (preds == solutions).sum().item()
         else:
             correct = 0
@@ -452,11 +469,11 @@ def evaluate(model, dataloader, device, limit_batches=None):
         
         logits = model(puzzles)
         loss = F.cross_entropy(
-            logits.permute(0, 3, 1, 2),
+            logits,
             solutions.long()
         )
         
-        preds = logits.argmax(dim=-1)
+        preds = logits.argmax(dim=1)
         
         # Cell-wise accuracy
         total_correct_cells += (preds == solutions).sum().item()
@@ -476,6 +493,145 @@ def evaluate(model, dataloader, device, limit_batches=None):
     return avg_loss, cell_acc, puzzle_acc
 
 
+class ReplayBuffer:
+    def __init__(self):
+        self.buffer = []
+    
+    def push(self, transition):
+        self.buffer.append(transition)
+    
+    def clear(self):
+        self.buffer = []
+    
+    def get_all(self):
+        return self.buffer
+
+def rl_train_epoch(model, dataloader, optimizer, device, epoch, ema=None):
+    model.train()
+    total_reward = 0.0
+    total_loss = 0.0
+    total_steps = 0
+    
+    pbar = tqdm(dataloader, desc=f"RL Epoch {epoch}", disable=True)
+    replay_buffer = ReplayBuffer()
+    
+    for batch_idx, batch in enumerate(pbar):
+        puzzles = batch["puzzle"].to(device)
+        solutions = batch["solution"].to(device)
+        B = puzzles.shape[0]
+        
+        # Rollout
+        h = model.h0.expand(B, -1, -1)
+        
+        optimizer.zero_grad()
+        
+        trajectory_rewards = 0
+        
+        for step in range(model.recursion_steps):
+            embeddings = model.get_embedding(puzzles)
+            h, logits, value = model.forward_step(embeddings, h)
+            
+            # Sample actions
+            # logits: [B, 10, 9, 9] -> [B*81, 10]
+            logits_flat = logits.permute(0, 2, 3, 1).reshape(-1, 10)
+            dist = Categorical(logits=logits_flat)
+            action_flat = dist.sample()
+            log_prob_flat = dist.log_prob(action_flat)
+            entropy_flat = dist.entropy()
+            
+            # Reshape for reward calc
+            action = action_flat.view(B, 9, 9)
+            
+            # Reward: +1 for correct cell, -1 for incorrect
+            # We want to encourage solving the puzzle
+            correct = (action == solutions).float()
+            reward = correct * 2 - 1 # [B, 9, 9] {-1, 1}
+            reward_flat = reward.view(-1)
+            
+            replay_buffer.push({
+                'value': value.view(-1), # [B*81]
+                'log_prob': log_prob_flat, # [B*81]
+                'reward': reward_flat, # [B*81]
+                'entropy': entropy_flat # [B*81]
+            })
+            
+            trajectory_rewards += reward.mean().item()
+            
+            h = h.detach()
+            
+        # Compute GAE and Returns
+        gamma = 0.99
+        gae_lambda = 0.95
+        
+        next_value = 0 
+        gae = 0
+        returns = []
+        
+        trajectory = replay_buffer.get_all()
+        
+        # Iterate backwards
+        for step in reversed(range(len(trajectory))):
+            val = trajectory[step]['value']
+            rew = trajectory[step]['reward']
+            
+            delta = rew + gamma * next_value - val
+            gae = delta + gamma * gae_lambda * gae
+            
+            ret = gae + val
+            returns.insert(0, ret)
+            
+            next_value = val.detach() # Detach for next step calculation
+            
+        # Compute Loss
+        policy_loss = torch.tensor(0.0, device=device)
+        value_loss = torch.tensor(0.0, device=device)
+        entropy_loss = torch.tensor(0.0, device=device)
+        
+        for step in range(len(trajectory)):
+            adv = returns[step] - trajectory[step]['value']
+            
+            # Policy loss: -log_prob * advantage
+            policy_loss += -(trajectory[step]['log_prob'] * adv.detach()).mean()
+            
+            # Value loss: MSE(value, return)
+            value_loss += F.mse_loss(trajectory[step]['value'], returns[step].detach())
+            
+            # Entropy loss (maximize entropy)
+            entropy_loss += -trajectory[step]['entropy'].mean()
+            
+        total_step_loss = policy_loss + 0.5 * value_loss + 0.01 * entropy_loss
+        total_step_loss = total_step_loss / len(trajectory)
+        
+        total_step_loss.backward()
+        optimizer.step()
+        
+        if ema is not None:
+            ema.update(model)
+            
+        replay_buffer.clear()
+        
+        total_loss += total_step_loss.item()
+        total_reward += trajectory_rewards / model.recursion_steps
+        total_steps += 1
+        
+        # Update progress bar
+        pbar.set_postfix({
+            'loss': f'{total_step_loss.item():.4f}',
+            'reward': f'{trajectory_rewards / model.recursion_steps:.4f}'
+        })
+        
+        if batch_idx % 50 == 0:
+            wandb.log({
+                'train/rl_loss': total_step_loss.item(),
+                'train/rl_reward': trajectory_rewards / model.recursion_steps,
+                'train/rl_policy_loss': policy_loss.item() / len(trajectory),
+                'train/rl_value_loss': value_loss.item() / len(trajectory),
+                'train/step': epoch * len(dataloader) + batch_idx,
+            })
+            
+    return total_loss / total_steps, total_reward / total_steps
+
+
 def main():
     # Hyperparameters
     config = {
@@ -483,39 +639,51 @@ def main():
         'lr': 1e-4,
         'weight_decay': 1e-5,
         'epochs': 50,
-        'depth': 3,
+        'depth': 1,
         'd_model': 128,
         'nhead': 16,
         'num_kv_heads': 2,  # GQA: 16 query heads, 2 key/value heads
-        'dim_feedforward': 512,
+        'dim_feedforward': 128 * 4,
         'dropout': 0.1,
         'use_gqa': True,  # Set to False to use standard multi-head attention
-        'use_ema': True,  # Use Exponential Moving Average
+        'use_ema': False,  # Use Exponential Moving Average
         'ema_decay': 0.9995,  # EMA decay rate
         'recursion_steps': 3, # Number of recursive steps (1 = standard)
+        'num_layers': 2, # Number of transformer layers in the leaf node
+        'node_recursion': 2, # Number of recursions per internal node
+        'use_mlp': False, # Use MLP in internal nodes
         'num_workers': 6,
         'device': 'cuda' if torch.cuda.is_available() else 'cpu',
     }
     
     # Initialize wandb
-    wandb.init(
+    run = wandb.init(
         project="arc-prize-sudoku-tree",
         config=config,
-        name=f"tree-depth{config['depth']}-d{config['d_model']}"
+        name=f"tree-depth{config['depth']}-d{config['d_model']}-{time.strftime('%Y%m%d-%H%M%S')}"
     )
+    
+    # Create checkpoint directory
+    checkpoint_dir = os.path.join("checkpoints", f"{run.name}-{run.id}")
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    print(f"Saving checkpoints to {checkpoint_dir}")
     
     device = torch.device(config['device'])
     print(f"Using device: {device}")
+    
+    # Enable TensorFloat32 for better performance on Ampere+ GPUs
+    if device.type == 'cuda':
+        torch.set_float32_matmul_precision('high')
     
     # Load data
     from sudoku_extreme_pipeline import SudokuDataset, sudoku_collate_fn
     
     print("Loading datasets...")
-    train_dataset = SudokuDataset(split="train")
+    train_dataset = SudokuDataset(split="train", limit=None)
     # train_dataset = Subset(train_dataset, range(100))  # Limit to 100 samples for testing
     
     # Use a small subset of test for validation (test set is smaller)
-    val_dataset = SudokuDataset(split="test")
+    val_dataset = SudokuDataset(split="test", limit=None)
     # val_dataset = Subset(val_dataset, range(50))  # Limit to 50 samples for testing
     
     train_loader = DataLoader(
@@ -550,9 +718,27 @@ def main():
         dropout=config['dropout'],
         use_gqa=config.get('use_gqa', True),
         recursion_steps=config.get('recursion_steps', 1),
+        num_layers=config.get('num_layers', 2),
+        node_recursion=config.get('node_recursion', 2),
+        use_mlp=config.get('use_mlp', True),
     ).to(device)
     
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+    # Initialize EMA before compilation to avoid issues with deepcopying compiled models
+    ema = None
+    if config.get('use_ema', False):
+        ema = EMA(model, decay=config.get('ema_decay', 0.9995), device=device)
+        print(f"Using EMA with decay: {config.get('ema_decay', 0.9995)}")
+
+    # Compile model
+    if hasattr(torch, 'compile'):
+        print("Compiling model with torch.compile...")
+        model = torch.compile(model)
+        # Also compile the methods used in the custom training loop
+        model.get_embedding = torch.compile(model.get_embedding)
+        model.forward_step = torch.compile(model.forward_step)
+
     wandb.watch(model, log='all', log_freq=100)
     
     optimizer = torch.optim.AdamW(
@@ -561,12 +747,6 @@ def main():
         weight_decay=config['weight_decay']
     )
     
-    # Initialize EMA
-    ema = None
-    if config.get('use_ema', False):
-        ema = EMA(model, decay=config.get('ema_decay', 0.9995), device=device)
-        print(f"Using EMA with decay: {config.get('ema_decay', 0.9995)}")
-    
     # Training loop
     best_val_acc = 0.0
     for epoch in range(1, config['epochs'] + 1):
@@ -574,7 +754,16 @@ def main():
         print(f"Epoch {epoch}/{config['epochs']}")
         print(f"{'='*50}")
         
-        train_loss, train_acc = train_epoch(model, train_loader, optimizer, device, epoch, ema)
+        if epoch <= 4:
+            print("Running Supervised Training")
+            train_loss, train_acc = train_epoch(model, train_loader, optimizer, device, epoch, ema)
+            print(f"\nTrain Loss: {train_loss:.4f}, Train Cell Acc: {train_acc:.4f}")
+        else:
+            print("Running RL Training")
+            train_loss, train_reward = rl_train_epoch(model, train_loader, optimizer, device, epoch, ema)
+            print(f"\nTrain RL Loss: {train_loss:.4f}, Train Reward: {train_reward:.4f}")
+            # Use dummy acc for logging
+            train_acc = 0.0
         
         # Determine validation size
         if epoch % 10 == 0 or epoch == config['epochs']:
@@ -637,7 +826,7 @@ def main():
                 'val_cell_acc': ema_val_cell_acc if ema is not None else val_cell_acc,
                 'val_puzzle_acc': ema_val_puzzle_acc if ema is not None else val_puzzle_acc,
                 'config': config,
-            }, 'checkpoints/best_tree_model.pt')
+            }, os.path.join(checkpoint_dir, 'best_tree_model.pt'))
             
             if ema is not None:
                 ema.restore(model)
