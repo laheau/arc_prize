@@ -367,6 +367,8 @@ def train_epoch(model, dataloader, optimizer, device, epoch, ema=None):
     total_loss = 0.0
     total_correct = 0
     total_cells = 0
+    total_correct_puzzles = 0
+    total_puzzles = 0
     
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}", disable=True)
     for batch_idx, batch in enumerate(pbar):
@@ -422,18 +424,28 @@ def train_epoch(model, dataloader, optimizer, device, epoch, ema=None):
         if logits is not None:
             preds = logits.argmax(dim=1)
             correct = (preds == solutions).sum().item()
+            
+            # Puzzle accuracy
+            correct_per_puzzle = (preds == solutions).view(puzzles.size(0), -1).all(dim=1)
+            correct_puzzles = correct_per_puzzle.sum().item()
         else:
             correct = 0
+            correct_puzzles = 0
+            
         cells = solutions.numel()
+        num_puzzles = puzzles.size(0)
         
         total_loss += batch_loss * puzzles.size(0)
         total_correct += correct
         total_cells += cells
+        total_correct_puzzles += correct_puzzles
+        total_puzzles += num_puzzles
         
         # Update progress bar
         pbar.set_postfix({
             'loss': f'{batch_loss:.4f}',
-            'acc': f'{correct/cells:.4f}'
+            'acc': f'{correct/cells:.4f}',
+            'p_acc': f'{correct_puzzles/num_puzzles:.4f}'
         })
         
         # Log to wandb every 50 steps
@@ -441,12 +453,14 @@ def train_epoch(model, dataloader, optimizer, device, epoch, ema=None):
             wandb.log({
                 'train/loss': batch_loss,
                 'train/accuracy': correct / cells,
+                'train/puzzle_accuracy': correct_puzzles / num_puzzles,
                 'train/step': epoch * len(dataloader) + batch_idx,
             })
     
     avg_loss = total_loss / len(dataloader.dataset)
     avg_acc = total_correct / total_cells
-    return avg_loss, avg_acc
+    avg_puzzle_acc = total_correct_puzzles / total_puzzles
+    return avg_loss, avg_acc, avg_puzzle_acc
 
 
 @torch.no_grad()
@@ -493,167 +507,227 @@ def evaluate(model, dataloader, device, limit_batches=None):
     return avg_loss, cell_acc, puzzle_acc
 
 
-class ReplayBuffer:
-    def __init__(self):
-        self.buffer = []
+def rl_train_epoch(model, dataloader, optimizer, device, epoch, ema=None, 
+                   ppo_clip=0.2, ppo_epochs=4, value_coef=0.5, entropy_coef=0.01):
+    """PPO training epoch.
     
-    def push(self, transition):
-        self.buffer.append(transition)
-    
-    def clear(self):
-        self.buffer = []
-    
-    def get_all(self):
-        return self.buffer
-
-def rl_train_epoch(model, dataloader, optimizer, device, epoch, ema=None):
+    Args:
+        model: The model to train
+        dataloader: Training data loader
+        optimizer: Optimizer
+        device: Device to use
+        epoch: Current epoch number
+        ema: Optional EMA tracker
+        ppo_clip: PPO clipping parameter (epsilon)
+        ppo_epochs: Number of PPO update epochs per batch
+        value_coef: Coefficient for value loss
+        entropy_coef: Coefficient for entropy bonus
+    """
     model.train()
     total_reward = 0.0
     total_loss = 0.0
     total_steps = 0
+    total_correct_puzzles = 0
+    total_puzzles = 0
     
     pbar = tqdm(dataloader, desc=f"RL Epoch {epoch}", disable=True)
-    replay_buffer = ReplayBuffer()
     
     for batch_idx, batch in enumerate(pbar):
         puzzles = batch["puzzle"].to(device)
         solutions = batch["solution"].to(device)
         B = puzzles.shape[0]
         
-        # Rollout
+        # 1. Rollout Phase (No Gradients) - Generate trajectory, actions, and old log probs
+        saved_h = []
+        saved_actions = []
+        saved_old_log_probs = []
+        saved_old_values = []
+        
+        # Initialize h
         h = model.h0.expand(B, -1, -1)
         
-        optimizer.zero_grad()
+        with torch.no_grad():
+            for step in range(model.recursion_steps):
+                saved_h.append(h.detach()) # Store input h for this step
+                
+                embeddings = model.get_embedding(puzzles)
+                h, logits, value = model.forward_step(embeddings, h)
+                
+                # Sample actions
+                logits_flat = logits.permute(0, 2, 3, 1).reshape(-1, 10)
+                dist = Categorical(logits=logits_flat)
+                action_flat = dist.sample()
+                
+                # Store old log probs and values for PPO
+                old_log_prob = dist.log_prob(action_flat)
+                saved_old_log_probs.append(old_log_prob)
+                saved_old_values.append(value.view(-1))
+                saved_actions.append(action_flat)
+                
+        # Calculate reward based on final action
+        final_action_flat = saved_actions[-1]
+        action = final_action_flat.view(B, 9, 9)
+        correct = (action == solutions).float()
         
-        trajectory_rewards = 0
+        # Calculate puzzle accuracy
+        correct_per_puzzle = (action == solutions).view(B, -1).all(dim=1)
+        correct_puzzles = correct_per_puzzle.sum().item()
         
-        for step in range(model.recursion_steps):
-            embeddings = model.get_embedding(puzzles)
-            h, logits, value = model.forward_step(embeddings, h)
-            
-            # Sample actions
-            # logits: [B, 10, 9, 9] -> [B*81, 10]
-            logits_flat = logits.permute(0, 2, 3, 1).reshape(-1, 10)
-            dist = Categorical(logits=logits_flat)
-            action_flat = dist.sample()
-            log_prob_flat = dist.log_prob(action_flat)
-            entropy_flat = dist.entropy()
-            
-            # Reshape for reward calc
-            action = action_flat.view(B, 9, 9)
-            
-            # Reward: +1 for correct cell, -1 for incorrect
-            # We want to encourage solving the puzzle
-            correct = (action == solutions).float()
-            reward = correct * 2 - 1 # [B, 9, 9] {-1, 1}
-            reward_flat = reward.view(-1)
-            
-            replay_buffer.push({
-                'value': value.view(-1), # [B*81]
-                'log_prob': log_prob_flat, # [B*81]
-                'reward': reward_flat, # [B*81]
-                'entropy': entropy_flat # [B*81]
-            })
-            
-            trajectory_rewards += reward.mean().item()
-            
-            h = h.detach()
-            
-        # Compute GAE and Returns
+        reward = correct * 2 - 1 # [B, 9, 9]
+        reward_flat = reward.view(-1) # [B*81]
+        
+        # Compute returns and advantages
         gamma = 0.99
-        gae_lambda = 0.95
+        T = model.recursion_steps
         
-        next_value = 0 
-        gae = 0
+        # Compute discounted returns for each step
         returns = []
+        for step in range(T):
+            discount = gamma ** (T - 1 - step)
+            ret = reward_flat * discount
+            returns.append(ret)
         
-        trajectory = replay_buffer.get_all()
+        # Compute advantages (return - value baseline)
+        advantages = []
+        for step in range(T):
+            adv = returns[step] - saved_old_values[step]
+            advantages.append(adv)
         
-        # Iterate backwards
-        for step in reversed(range(len(trajectory))):
-            val = trajectory[step]['value']
-            rew = trajectory[step]['reward']
-            
-            delta = rew + gamma * next_value - val
-            gae = delta + gamma * gae_lambda * gae
-            
-            ret = gae + val
-            returns.insert(0, ret)
-            
-            next_value = val.detach() # Detach for next step calculation
-            
-        # Compute Loss
-        policy_loss = torch.tensor(0.0, device=device)
-        value_loss = torch.tensor(0.0, device=device)
-        entropy_loss = torch.tensor(0.0, device=device)
+        # 2. PPO Training Phase - Multiple epochs of updates
+        batch_loss_accum = 0.0
         
-        for step in range(len(trajectory)):
-            adv = returns[step] - trajectory[step]['value']
+        for ppo_epoch in range(ppo_epochs):
+            optimizer.zero_grad()
             
-            # Policy loss: -log_prob * advantage
-            policy_loss += -(trajectory[step]['log_prob'] * adv.detach()).mean()
+            epoch_loss = 0.0
             
-            # Value loss: MSE(value, return)
-            value_loss += F.mse_loss(trajectory[step]['value'], returns[step].detach())
+            for step in range(T):
+                # Retrieve state and action
+                h_input = saved_h[step] # Detached
+                action_flat = saved_actions[step]
+                old_log_prob = saved_old_log_probs[step]
+                advantage = advantages[step].detach()  # Detach advantages
+                ret = returns[step].detach()  # Detach returns for value loss
+                
+                # Normalize advantages (per step)
+                advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
+                
+                # Re-forward to get the graph for this step
+                embeddings = model.get_embedding(puzzles)
+                _, logits, value = model.forward_step(embeddings, h_input)
+                
+                logits_flat = logits.permute(0, 2, 3, 1).reshape(-1, 10)
+                dist = Categorical(logits=logits_flat)
+                
+                new_log_prob = dist.log_prob(action_flat)
+                entropy = dist.entropy()
+                
+                # PPO clipped surrogate objective
+                ratio = torch.exp(new_log_prob - old_log_prob.detach())
+                surr1 = ratio * advantage
+                surr2 = torch.clamp(ratio, 1.0 - ppo_clip, 1.0 + ppo_clip) * advantage
+                policy_loss = -torch.min(surr1, surr2).mean()
+                
+                # Value loss (MSE between predicted value and returns)
+                value_flat = value.view(-1)
+                value_loss = F.mse_loss(value_flat, ret)
+                
+                # Entropy bonus (encourage exploration)
+                entropy_loss = -entropy.mean()
+                
+                # Combined loss (average over steps)
+                step_loss = (policy_loss + value_coef * value_loss + entropy_coef * entropy_loss) / T
+                
+                step_loss.backward()
+                epoch_loss += step_loss.item()
             
-            # Entropy loss (maximize entropy)
-            entropy_loss += -trajectory[step]['entropy'].mean()
+            # Gradient clipping for stability
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
             
-        total_step_loss = policy_loss + 0.5 * value_loss + 0.01 * entropy_loss
-        total_step_loss = total_step_loss / len(trajectory)
+            optimizer.step()
+            batch_loss_accum += epoch_loss
         
-        total_step_loss.backward()
-        optimizer.step()
+        # Average loss over PPO epochs
+        batch_loss_accum /= ppo_epochs
         
         if ema is not None:
             ema.update(model)
             
-        replay_buffer.clear()
-        
-        total_loss += total_step_loss.item()
-        total_reward += trajectory_rewards / model.recursion_steps
+        total_loss += batch_loss_accum
+        total_reward += reward.mean().item()
         total_steps += 1
+        total_correct_puzzles += correct_puzzles
+        total_puzzles += B
         
         # Update progress bar
         pbar.set_postfix({
-            'loss': f'{total_step_loss.item():.4f}',
-            'reward': f'{trajectory_rewards / model.recursion_steps:.4f}'
+            'loss': f'{batch_loss_accum:.4f}',
+            'reward': f'{reward.mean().item():.4f}',
+            'p_acc': f'{correct_puzzles/B:.4f}'
         })
         
         if batch_idx % 50 == 0:
             wandb.log({
-                'train/rl_loss': total_step_loss.item(),
-                'train/rl_reward': trajectory_rewards / model.recursion_steps,
-                'train/rl_policy_loss': policy_loss.item() / len(trajectory),
-                'train/rl_value_loss': value_loss.item() / len(trajectory),
+                'train/rl_loss': batch_loss_accum,
+                'train/rl_reward': reward.mean().item(),
+                'train/rl_puzzle_accuracy': correct_puzzles / B,
                 'train/step': epoch * len(dataloader) + batch_idx,
             })
             
-    return total_loss / total_steps, total_reward / total_steps
+    return total_loss / total_steps, total_reward / total_steps, total_correct_puzzles / total_puzzles
+
+
+def get_rl_lr(epoch, rl_start_epoch, warmup_epochs, rl_lr, min_lr_ratio=0.1):
+    """Get learning rate for RL fine-tuning with warmup.
+    
+    Args:
+        epoch: Current epoch (1-indexed)
+        rl_start_epoch: Epoch when RL training starts
+        warmup_epochs: Number of warmup epochs for RL
+        rl_lr: Target RL learning rate after warmup
+        min_lr_ratio: Starting LR is rl_lr * min_lr_ratio
+    
+    Returns:
+        Learning rate for the current epoch
+    """
+    rl_epoch = epoch - rl_start_epoch  # 0-indexed RL epoch
+    
+    if rl_epoch < warmup_epochs:
+        # Linear warmup from min_lr to rl_lr
+        warmup_progress = (rl_epoch + 1) / warmup_epochs
+        return rl_lr * (min_lr_ratio + (1 - min_lr_ratio) * warmup_progress)
+    else:
+        # After warmup, use full rl_lr
+        return rl_lr
 
 
 def main():
     # Hyperparameters
     config = {
-        'batch_size': 128,
+        'batch_size': 512,
         'lr': 1e-4,
         'weight_decay': 1e-5,
         'epochs': 50,
         'depth': 1,
-        'd_model': 128,
-        'nhead': 16,
+        'd_model': 512,
+        'nhead': 8,
         'num_kv_heads': 2,  # GQA: 16 query heads, 2 key/value heads
-        'dim_feedforward': 128 * 4,
+        'dim_feedforward': 512 * 4,
         'dropout': 0.1,
-        'use_gqa': True,  # Set to False to use standard multi-head attention
+        'use_gqa': False,  # Set to False to use standard multi-head attention
         'use_ema': False,  # Use Exponential Moving Average
         'ema_decay': 0.9995,  # EMA decay rate
-        'recursion_steps': 3, # Number of recursive steps (1 = standard)
+        'recursion_steps': 6, # Number of recursive steps (1 = standard)
         'num_layers': 2, # Number of transformer layers in the leaf node
-        'node_recursion': 2, # Number of recursions per internal node
+        'node_recursion': 3, # Number of recursions per internal node
         'use_mlp': False, # Use MLP in internal nodes
         'num_workers': 6,
         'device': 'cuda' if torch.cuda.is_available() else 'cpu',
+        # RL fine-tuning config
+        'rl_start_epoch': 6,  # Epoch to start RL training (1-indexed)
+        'rl_lr': 1e-5,  # Target LR for RL (lower than supervised)
+        'rl_warmup_epochs': 3,  # Number of warmup epochs for RL
+        'rl_min_lr_ratio': 0.1,  # Start warmup at rl_lr * this ratio
     }
     
     # Initialize wandb
@@ -754,16 +828,32 @@ def main():
         print(f"Epoch {epoch}/{config['epochs']}")
         print(f"{'='*50}")
         
-        if epoch <= 4:
+        rl_start_epoch = config.get('rl_start_epoch', 6)
+        
+        if epoch < rl_start_epoch:
             print("Running Supervised Training")
-            train_loss, train_acc = train_epoch(model, train_loader, optimizer, device, epoch, ema)
-            print(f"\nTrain Loss: {train_loss:.4f}, Train Cell Acc: {train_acc:.4f}")
+            train_loss, train_acc, train_puzzle_acc = train_epoch(model, train_loader, optimizer, device, epoch, ema)
+            print(f"\nTrain Loss: {train_loss:.4f}, Train Cell Acc: {train_acc:.4f}, Train Puzzle Acc: {train_puzzle_acc:.4f}")
         else:
-            print("Running RL Training")
-            train_loss, train_reward = rl_train_epoch(model, train_loader, optimizer, device, epoch, ema)
-            print(f"\nTrain RL Loss: {train_loss:.4f}, Train Reward: {train_reward:.4f}")
+            # Update learning rate for RL with warmup
+            current_rl_lr = get_rl_lr(
+                epoch=epoch,
+                rl_start_epoch=rl_start_epoch,
+                warmup_epochs=config.get('rl_warmup_epochs', 3),
+                rl_lr=config.get('rl_lr', 1e-5),
+                min_lr_ratio=config.get('rl_min_lr_ratio', 0.1)
+            )
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = current_rl_lr
+            
+            print(f"Running RL Training (lr={current_rl_lr:.2e})")
+            train_loss, train_reward, train_puzzle_acc = rl_train_epoch(model, train_loader, optimizer, device, epoch, ema)
+            print(f"\nTrain RL Loss: {train_loss:.4f}, Train Reward: {train_reward:.4f}, Train Puzzle Acc: {train_puzzle_acc:.4f}")
             # Use dummy acc for logging
             train_acc = 0.0
+            
+            # Log RL learning rate
+            wandb.log({'train/rl_learning_rate': current_rl_lr, 'epoch': epoch})
         
         # Determine validation size
         if epoch % 10 == 0 or epoch == config['epochs']:
@@ -794,6 +884,7 @@ def main():
             'epoch': epoch,
             'train/epoch_loss': train_loss,
             'train/epoch_accuracy': train_acc,
+            'train/epoch_puzzle_accuracy': train_puzzle_acc,
             'val/loss': val_loss,
             'val/cell_accuracy': val_cell_acc,
             'val/puzzle_accuracy': val_puzzle_acc,
